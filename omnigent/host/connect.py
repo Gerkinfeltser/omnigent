@@ -311,6 +311,13 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # alias, still propagated so existing setups keep working.
         "OMNIGENT_AUTH_ENABLED",
         "OMNIGENT_ACCOUNTS_ENABLED",
+        # State mode for hermes-native harness — must propagate so the
+        # runner knows whether to create a managed HERMES_HOME or use
+        # the user's ~/.hermes directly.
+        "OMNIGENT_HERMES_NATIVE_STATE_MODE",
+        # HERMES_HOME path — must propagate to runner so the Hermes TUI
+        # knows which home directory to load. Not a secret, just a path.
+        "HERMES_HOME",
         # Secret-store backend selector. The CLI's `configure harnesses` stores
         # pasted API keys via the file backend when this is set (headless /
         # locked-keyring hosts), writing `keychain:<name>` refs. The runner

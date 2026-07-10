@@ -46,12 +46,19 @@ const DISPLAY_NAMES: Record<string, string> = {
   nessie: "Nessie",
   polly: "Polly",
   debby: "Debby",
+  "hermana-omni": "Hermana Omni",
 };
 
-function displayNameForAgent(name: string, harness?: string | null): string {
+function displayNameForAgent(
+  name: string,
+  harness?: string | null,
+  builtin?: boolean,
+): string {
+  const nativeAgent = nativeCodingAgentForHarness(harness) ?? nativeCodingAgentForAgentName(name);
+  if (nativeAgent !== undefined && (builtin !== false || name === nativeAgent.agentName)) {
+    return nativeAgent.displayName;
+  }
   return (
-    nativeCodingAgentForHarness(harness)?.displayName ??
-    nativeCodingAgentForAgentName(name)?.displayName ??
     DISPLAY_NAMES[name] ??
     capitalizeAgentName(name)
   );
@@ -128,7 +135,7 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
   return rows.map((a) => ({
     id: a.id,
     name: a.name,
-    display_name: displayNameForAgent(a.name, a.harness),
+    display_name: displayNameForAgent(a.name, a.harness, a.builtin),
     description: a.description ?? null,
     harness: a.harness ?? null,
     skills: a.skills ?? [],
@@ -221,7 +228,7 @@ async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<Availab
     const json = (await res.json()) as AgentObjectWire;
     return {
       ...fallback,
-      display_name: displayNameForAgent(json.name, json.harness),
+      display_name: displayNameForAgent(json.name, json.harness, false),
       description: json.description ?? null,
       harness: json.harness ?? null,
       skills: json.skills ?? [],
