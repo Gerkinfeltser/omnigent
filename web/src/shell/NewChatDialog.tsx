@@ -75,6 +75,7 @@ import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
 import {
+  catalogHarnessIdForNativeCodingAgent,
   isNativeCodingAgent,
   nativeAgentHasCapability,
   nativeCodingAgentForAvailableAgent,
@@ -1736,8 +1737,12 @@ export function NewChatLandingScreen() {
   // builtins/customs split: Polly & Debby are built-ins but belong under
   // "Agents", not "Harnesses".
   const harnessEntries = useMemo(
-    () => agentList.filter((a) => isNativeCodingAgent(a)),
-    [agentList],
+    () =>
+      agentList.filter((a) => {
+        const catalogHarnessId = catalogHarnessIdForNativeCodingAgent(a);
+        return catalogHarnessId != null && catalogHarnessId in brainHarnessLabels;
+      }),
+    [agentList, brainHarnessLabels],
   );
   const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
 
