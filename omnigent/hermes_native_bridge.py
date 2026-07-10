@@ -344,6 +344,7 @@ _USER_CONFIG_KEYS = frozenset(
         "providers",
         "fallback_providers",
         "credential_pool_strategies",
+        "secrets",
     }
 )
 

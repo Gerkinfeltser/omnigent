@@ -50,12 +50,19 @@ const DISPLAY_NAMES: Record<string, string> = {
   nessie: "Nessie",
   polly: "Polly",
   debby: "Debby",
+  "hermana-omni": "Hermana Omni",
 };
 
-function displayNameForAgent(name: string, harness?: string | null): string {
+function displayNameForAgent(
+  name: string,
+  harness?: string | null,
+  builtin?: boolean,
+): string {
+  const nativeAgent = nativeCodingAgentForHarness(harness) ?? nativeCodingAgentForAgentName(name);
+  if (nativeAgent !== undefined && (builtin !== false || name === nativeAgent.agentName)) {
+    return nativeAgent.displayName;
+  }
   return (
-    nativeCodingAgentForHarness(harness)?.displayName ??
-    nativeCodingAgentForAgentName(name)?.displayName ??
     DISPLAY_NAMES[name] ??
     capitalizeAgentName(name)
   );
@@ -132,7 +139,7 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
   return rows.map((a) => ({
     id: a.id,
     name: a.name,
-    display_name: displayNameForAgent(a.name, a.harness),
+    display_name: displayNameForAgent(a.name, a.harness, a.builtin),
     description: a.description ?? null,
     harness: a.harness ?? null,
     skills: a.skills ?? [],
@@ -233,7 +240,7 @@ export async function prefetchAvailableAgentDetails(
     );
     if (!res.ok) return;
     const json = (await res.json()) as AgentObjectWire;
-    queryClient.setQueryData<AvailableAgent[]>(["available-agents"], (prev) => {
+queryClient.setQueryData<AvailableAgent[]>(["available-agents"], (prev) => {
       if (!prev) return prev;
       const enriched = prev.map((a) =>
         a.id !== agent.id

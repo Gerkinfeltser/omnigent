@@ -162,6 +162,13 @@ describe("useAvailableAgents", () => {
             harness: "opencode-native",
           },
           {
+            id: "ag_hermana_omni",
+            name: "hermana-omni",
+            description: "Hermes-native orchestrator.",
+            harness: "hermes-native",
+            builtin: false,
+          },
+          {
             id: "ag_nessie",
             name: "nessie",
             description: "Multi-agent coding orchestrator.",
@@ -199,7 +206,8 @@ describe("useAvailableAgents", () => {
     // `skills` passes through verbatim (nessie) and normalises to []
     // when the wire field is absent (older servers) — the landing
     // composer's "/" menu indexes it unconditionally.
-    expect(result.current.data).toEqual([
+    expect(result.current.data).toHaveLength(9);
+    expect(result.current.data).toMatchObject([
       {
         id: "ag_native",
         name: "claude-native-ui",
@@ -263,6 +271,15 @@ describe("useAvailableAgents", () => {
         description: "A coding agent",
         harness: "codex",
         skills: [],
+      },
+      {
+        id: "ag_hermana_omni",
+        name: "hermana-omni",
+        display_name: "Hermana Omni",
+        description: "Hermes-native orchestrator.",
+        harness: "hermes-native",
+        skills: [],
+        builtin: false,
       },
     ]);
   });
