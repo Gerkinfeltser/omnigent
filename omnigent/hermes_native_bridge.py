@@ -320,19 +320,28 @@ def build_hermes_native_spawn_env(session_id: str) -> dict[str, str]:
 
     Publishes the per-session bridge dir so the
     :class:`~omnigent.inner.hermes_native_executor.HermesNativeExecutor` can find
-    the tmux target advertised by the runner. If a per-session ``HERMES_HOME``
-    was written by :func:`write_policy_hook_config`, the env includes
-    ``HERMES_HOME`` so the TUI picks up the policy hook.
+    the tmux target advertised by the runner. Managed sessions receive their
+    generated ``HERMES_HOME``. Ambient Captain sessions instead receive only a
+    session-owned ``HERMES_MANAGED_DIR`` overlay, preserving the inherited real
+    Hermes home.
 
     :param session_id: The Omnigent session id (keys the bridge dir).
     :returns: Env-var overrides for the harness executor spawn.
+    :raises RuntimeError: If a bridge incorrectly contains both state modes.
     """
     bridge_dir = bridge_dir_for_session_id(session_id)
     _ensure_dir(bridge_dir)
     env: dict[str, str] = {BRIDGE_DIR_ENV_VAR: str(bridge_dir)}
     hermes_home = read_hermes_home(bridge_dir)
+    managed_dir = read_ambient_mcp_overlay(bridge_dir)
+    if hermes_home is not None and managed_dir is not None:
+        raise RuntimeError(
+            "hermes-native bridge cannot contain both managed home and ambient overlay"
+        )
     if hermes_home is not None:
         env["HERMES_HOME"] = str(hermes_home)
+    elif managed_dir is not None:
+        env["HERMES_MANAGED_DIR"] = str(managed_dir)
     return env
 
 
@@ -349,6 +358,79 @@ _USER_CONFIG_KEYS = frozenset(
 )
 
 _HERMES_HOME_SUBDIR = "hermes_home"
+_AMBIENT_MCP_OVERLAY_SUBDIR = "hermes-managed"
+
+
+def _omnigent_mcp_server_config(bridge_dir: Path) -> dict[str, Any]:
+    """Return the session-scoped stdio MCP entry for the active bridge."""
+    return {
+        "command": sys.executable,
+        "args": [
+            "-m",
+            "omnigent.claude_native_bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            str(bridge_dir),
+        ],
+    }
+
+
+def write_ambient_mcp_overlay(bridge_dir: Path) -> Path:
+    """Write the additive MCP overlay for one ambient Hermes Captain.
+
+    The overlay is selected only in the spawned Captain environment through
+    ``HERMES_MANAGED_DIR``. It deliberately contains no copied home state,
+    credentials, user configuration, or policy hook. It does create the
+    session-owned parent ``bridge.json`` token that ``serve-mcp`` requires.
+
+    :param bridge_dir: Session-owned Omnigent bridge directory.
+    :returns: The managed-config directory to set on the child process.
+    :raises RuntimeError: If the runner inherited a managed scope that this
+        first implementation cannot safely compose with.
+    """
+    inherited_managed_dir = os.environ.get("HERMES_MANAGED_DIR", "").strip()
+    if inherited_managed_dir:
+        raise RuntimeError(
+            "HERMES_MANAGED_DIR is already set in the runner environment; "
+            "refusing to replace an inherited managed scope"
+        )
+
+    _ensure_dir(bridge_dir)
+    overlay_dir = bridge_dir / _AMBIENT_MCP_OVERLAY_SUBDIR
+    _ensure_dir(overlay_dir)
+    _write_mcp_bridge_config(bridge_dir)
+    config = {"mcp_servers": {"omnigent": _omnigent_mcp_server_config(bridge_dir)}}
+    (overlay_dir / "config.yaml").write_text(json.dumps(config, indent=2) + "\n")
+    return overlay_dir
+
+
+def read_ambient_mcp_overlay(bridge_dir: Path) -> Path | None:
+    """Return the ambient MCP overlay when this bridge owns a valid config."""
+    overlay_dir = bridge_dir / _AMBIENT_MCP_OVERLAY_SUBDIR
+    if (overlay_dir / "config.yaml").is_file():
+        return overlay_dir
+    return None
+
+
+def prepare_hermes_native_spawn_env(
+    session_id: str,
+    *,
+    state_mode: str,
+    server_url: str | None = None,
+) -> dict[str, str]:
+    """Prepare one state mode, then return its isolated harness spawn env.
+
+    Ambient setup writes only the MCP overlay. Managed setup retains the existing
+    policy-hook home behavior and therefore requires the Omnigent server URL.
+    """
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    if normalize_hermes_native_state_mode(state_mode) == STATE_MODE_AMBIENT:
+        write_ambient_mcp_overlay(bridge_dir)
+    else:
+        if not server_url:
+            raise ValueError("server_url is required for managed hermes-native setup")
+        write_policy_hook_config(bridge_dir, server_url, session_id)
+    return build_hermes_native_spawn_env(session_id)
 
 
 def _load_user_hermes_config() -> dict:
@@ -442,16 +524,7 @@ def write_policy_hook_config(
     # Omnigent builtin tools (sys_session_*, sys_agent_*, load_skill, etc.).
     config["mcp_servers"] = {
         **config.get("mcp_servers", {}),
-        "omnigent": {
-            "command": sys.executable,
-            "args": [
-                "-m",
-                "omnigent.claude_native_bridge",
-                "serve-mcp",
-                "--bridge-dir",
-                str(bridge_dir),
-            ],
-        },
+        "omnigent": _omnigent_mcp_server_config(bridge_dir),
     }
 
     config_path = hermes_home / "config.yaml"
@@ -699,10 +772,12 @@ def _state_db_path(bridge_dir: Path) -> Path | None:
 
     Prefers the per-session ``HERMES_HOME`` under *bridge_dir* (created by
     :func:`write_policy_hook_config` and passed to the TUI as ``HERMES_HOME``),
-    then ``$HERMES_HOME``, then the default ``~/.hermes``. Returns the EXPECTED
-    path even if the file does not exist yet — on a fresh session Hermes creates
-    ``state.db`` lazily, and the delivery check treats a missing DB as
-    ``MAX(id) == 0`` so the first persisted row still registers as new.
+    then ``$HERMES_HOME``. An ambient ``HERMES_MANAGED_DIR`` changes only the
+    config layer, not Hermes' state home, so it intentionally resolves to the
+    default ``~/.hermes/state.db``. Returns the EXPECTED path even if the file
+    does not exist yet — on a fresh session Hermes creates ``state.db`` lazily,
+    and the delivery check treats a missing DB as ``MAX(id) == 0`` so the first
+    persisted row still registers as new.
 
     :returns: The state DB path, or ``None`` when no plausible home is known (no
         per-session home, no ``$HERMES_HOME``, no ``~/.hermes`` dir) — the caller

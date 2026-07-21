@@ -156,6 +156,16 @@ def test_state_db_path_prefers_per_session_home(tmp_path, monkeypatch) -> None:
     assert b._state_db_path(tmp_path) == home / "state.db"
 
 
+def test_state_db_path_uses_real_home_for_ambient_managed_overlay(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "bridge" / "hermes-managed"))
+    real_home = tmp_path / "real-home"
+    (real_home / ".hermes").mkdir(parents=True)
+    monkeypatch.setattr(b.Path, "home", staticmethod(lambda: real_home))
+
+    assert b._state_db_path(tmp_path / "bridge") == real_home / ".hermes" / "state.db"
+
+
 def test_max_message_id_reads_high_water_mark(tmp_path) -> None:
     db = tmp_path / "state.db"
     # Missing file → 0.
@@ -382,6 +392,60 @@ def test_build_spawn_env_no_hermes_home_without_policy(tmp_path, monkeypatch) ->
     monkeypatch.setattr(b, "_BRIDGE_ROOT", tmp_path / "hermes-native")
     env = b.build_hermes_native_spawn_env("test-no-policy")
     assert "HERMES_HOME" not in env
+
+
+def test_ambient_overlay_adds_only_relay_and_preserves_home(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(b, "_BRIDGE_ROOT", tmp_path / "hermes-native")
+    bridge_dir = b.bridge_dir_for_session_id("ambient-session")
+    bridge_dir.mkdir(parents=True)
+
+    overlay_dir = b.write_ambient_mcp_overlay(bridge_dir)
+
+    assert overlay_dir == bridge_dir / "hermes-managed"
+    config = json.loads((overlay_dir / "config.yaml").read_text())
+    assert list(config) == ["mcp_servers"]
+    mcp = config["mcp_servers"]["omnigent"]
+    assert mcp["command"] == sys.executable
+    assert mcp["args"][-2:] == ["--bridge-dir", str(bridge_dir)]
+    assert not (bridge_dir / "hermes_home").exists()
+    assert not (overlay_dir / ".env").exists()
+    assert not (overlay_dir / "auth.json").exists()
+    assert not (overlay_dir / "omnigent-policy-hook.sh").exists()
+
+    env = b.build_hermes_native_spawn_env("ambient-session")
+    assert env["HERMES_MANAGED_DIR"] == str(overlay_dir)
+    assert "HERMES_HOME" not in env
+    assert (bridge_dir / "bridge.json").is_file()
+
+
+def test_ambient_overlay_rejects_inherited_managed_scope(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_MANAGED_DIR", "/existing/managed-scope")
+
+    with pytest.raises(RuntimeError, match="HERMES_MANAGED_DIR is already set"):
+        b.write_ambient_mcp_overlay(tmp_path / "bridge")
+
+
+def test_build_spawn_env_rejects_mixed_managed_and_ambient_bridge(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(b, "_BRIDGE_ROOT", tmp_path / "hermes-native")
+    bridge_dir = b.bridge_dir_for_session_id("mixed-session")
+    (bridge_dir / "hermes_home").mkdir(parents=True)
+    overlay_dir = bridge_dir / "hermes-managed"
+    overlay_dir.mkdir(parents=True)
+    (overlay_dir / "config.yaml").write_text("{}\n")
+
+    with pytest.raises(RuntimeError, match="both managed home and ambient overlay"):
+        b.build_hermes_native_spawn_env("mixed-session")
+
+
+def test_prepare_spawn_env_for_ambient_writes_overlay(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(b, "_BRIDGE_ROOT", tmp_path / "hermes-native")
+
+    env = b.prepare_hermes_native_spawn_env("ambient-spawn", state_mode="ambient")
+
+    bridge_dir = b.bridge_dir_for_session_id("ambient-spawn")
+    assert env["HERMES_MANAGED_DIR"] == str(bridge_dir / "hermes-managed")
+    assert "HERMES_HOME" not in env
+    assert (bridge_dir / "hermes-managed" / "config.yaml").is_file()
 
 
 def test_normalize_hermes_native_state_mode() -> None:

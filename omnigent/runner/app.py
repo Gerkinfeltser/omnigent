@@ -2529,6 +2529,23 @@ async def _auto_create_goose_terminal(
     return terminal_view
 
 
+def _warn_ambient_fork_history_skip(
+    *,
+    fork_carry_history: bool,
+    managed_hermes_home: Path | None,
+    session_id: str,
+) -> bool:
+    """Warn when ambient mode safely skips isolated-state history cloning."""
+    if not fork_carry_history or managed_hermes_home is not None:
+        return False
+    _logger.warning(
+        "fork-with-history is unavailable in ambient Hermes mode; "
+        "skipping isolated state.db clone for session=%s",
+        session_id,
+    )
+    return True
+
+
 async def _auto_create_hermes_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -2564,9 +2581,10 @@ async def _auto_create_hermes_terminal(
     from omnigent.hermes_native_bridge import (
         STATE_MODE_AMBIENT,
         bridge_dir_for_session_id,
+        prepare_hermes_native_spawn_env,
+        read_ambient_mcp_overlay,
         read_hermes_home,
         resolve_hermes_native_state_mode,
-        write_policy_hook_config,
         write_tmux_target,
     )
     from omnigent.hermes_native_forwarder import clear_hermes_bridge_state
@@ -2588,14 +2606,27 @@ async def _auto_create_hermes_terminal(
     hermes_state_mode = resolve_hermes_native_state_mode(
         snapshot={"hermes_native_state_mode": launch_config.hermes_native_state_mode}
     )
-    if hermes_state_mode != STATE_MODE_AMBIENT:
-        # Write a per-session HERMES_HOME with the Omnigent policy hook so the
-        # native TUI evaluates tool calls against Omnigent policies.
-        _hermes_server_url = _required_runner_env("RUNNER_SERVER_URL")
-        write_policy_hook_config(bridge_dir, _hermes_server_url, session_id)
-    else:
+    _hermes_server_url = (
+        _required_runner_env("RUNNER_SERVER_URL")
+        if hermes_state_mode != STATE_MODE_AMBIENT
+        else None
+    )
+    prepare_hermes_native_spawn_env(
+        session_id,
+        state_mode=hermes_state_mode,
+        server_url=_hermes_server_url,
+    )
+    if hermes_state_mode == STATE_MODE_AMBIENT:
+        # Hermes performs its first MCP discovery at startup. Create the relay
+        # before the TUI launches so its tool_relay.json is already available.
+        if server_client is not None and ensure_comment_relay is not None:
+            await ensure_comment_relay(
+                session_id,
+                explicit_bridge_dir=bridge_dir,
+                await_notify=False,
+            )
         _logger.info(
-            "Launching hermes-native in ambient state mode; "
+            "Launching hermes-native in ambient state mode with session MCP overlay; "
             "session=%s uses the user's normal ~/.hermes",
             session_id,
         )
@@ -2607,14 +2638,28 @@ async def _auto_create_hermes_terminal(
     # cursor (clear_hermes_bridge_state above) starts it at that row's first row.
     launch_epoch_s = time.time()
     hermes_args = [*(launch_config.terminal_launch_args or [])]
-    # Resolve the per-session HERMES_HOME early: the fork block below needs it
-    # to place the cloned state.db, and the env block after needs it for the
-    # HERMES_HOME env var.
+    # Resolve the per-session state paths early: the fork block below needs the
+    # managed home for cloned state.db, while the terminal env needs either that
+    # managed home or the ambient MCP overlay.
     _hermes_home_path = read_hermes_home(bridge_dir)
+    _ambient_mcp_overlay = read_ambient_mcp_overlay(bridge_dir)
+    if _hermes_home_path is not None and _ambient_mcp_overlay is not None:
+        raise RuntimeError(
+            "hermes-native bridge cannot contain both managed home and ambient overlay"
+        )
     # Fork with history: clone the source Hermes session's state.db into the
-    # new session's HERMES_HOME so the TUI loads the prior conversation context
-    # under a fresh session id (true fork, not a shared --resume).
-    if launch_config.fork_carry_history and launch_config.fork_source_external_id:
+    # new session's managed HERMES_HOME. Ambient mode intentionally has no
+    # isolated target database, so it must warn and leave real state untouched.
+    _ambient_fork_skipped = _warn_ambient_fork_history_skip(
+        fork_carry_history=launch_config.fork_carry_history,
+        managed_hermes_home=_hermes_home_path,
+        session_id=session_id,
+    )
+    if (
+        not _ambient_fork_skipped
+        and launch_config.fork_carry_history
+        and launch_config.fork_source_external_id
+    ):
         from omnigent.hermes_native_bridge import (
             clone_hermes_session,
             mint_hermes_session_id,
@@ -2674,11 +2719,13 @@ async def _auto_create_hermes_terminal(
                     # Remove broken state.db so Hermes starts fresh.
                     if _target_db.exists():
                         _target_db.unlink()
-    # If a per-session HERMES_HOME was written (policy hook), pass it via env
-    # so the TUI picks up the hook config alongside its own approval prompt.
+    # Managed sessions override HERMES_HOME for policy hooks. Ambient Captain
+    # sessions instead receive only their session-local managed config overlay.
     _hermes_terminal_env: dict[str, str] = {}
     if _hermes_home_path is not None:
         _hermes_terminal_env["HERMES_HOME"] = str(_hermes_home_path)
+    elif _ambient_mcp_overlay is not None:
+        _hermes_terminal_env["HERMES_MANAGED_DIR"] = str(_ambient_mcp_overlay)
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
         terminal_name="hermes",
@@ -2726,7 +2773,13 @@ async def _auto_create_hermes_terminal(
     from omnigent.hermes_native_forwarder import supervise_hermes_forwarder
     from omnigent.hermes_native_permissions import supervise_hermes_approval_mirror
 
-    if server_client is not None and ensure_comment_relay is not None:
+    # Managed launches retain their existing post-launch relay setup. Ambient
+    # launches set it up before the TUI starts so MCP discovery sees it first.
+    if (
+        hermes_state_mode != STATE_MODE_AMBIENT
+        and server_client is not None
+        and ensure_comment_relay is not None
+    ):
         await ensure_comment_relay(
             session_id,
             explicit_bridge_dir=bridge_dir,
@@ -9025,12 +9078,8 @@ def create_runner_app(
             if harness_name == "hermes-native" and spawn_env is None:
                 from omnigent.hermes_native_bridge import (
                     STATE_MODE_AMBIENT,
-                    build_hermes_native_spawn_env,
+                    prepare_hermes_native_spawn_env,
                     resolve_hermes_native_state_mode,
-                    write_policy_hook_config,
-                )
-                from omnigent.hermes_native_bridge import (
-                    bridge_dir_for_session_id as _hermes_bridge_dir,
                 )
 
                 labels = await _session_labels_for_runner_spawn(
@@ -9040,14 +9089,16 @@ def create_runner_app(
                 _hermes_state_mode = resolve_hermes_native_state_mode(
                     snapshot={"labels": labels}
                 )
-                if _hermes_state_mode != STATE_MODE_AMBIENT:
-                    _h_server_url = os.environ.get(
-                        "RUNNER_SERVER_URL", "http://localhost:6767"
-                    ).rstrip("/")
-                    write_policy_hook_config(
-                        _hermes_bridge_dir(session_id), _h_server_url, session_id
-                    )
-                spawn_env = build_hermes_native_spawn_env(session_id)
+                _h_server_url = (
+                    os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/")
+                    if _hermes_state_mode != STATE_MODE_AMBIENT
+                    else None
+                )
+                spawn_env = prepare_hermes_native_spawn_env(
+                    session_id,
+                    state_mode=_hermes_state_mode,
+                    server_url=_h_server_url,
+                )
             if harness_name == "qwen-native" and spawn_env is None:
                 from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
 
@@ -14260,12 +14311,8 @@ def create_runner_app(
         if harness_name == "hermes-native" and spawn_env is None:
             from omnigent.hermes_native_bridge import (
                 STATE_MODE_AMBIENT,
-                build_hermes_native_spawn_env,
+                prepare_hermes_native_spawn_env,
                 resolve_hermes_native_state_mode,
-                write_policy_hook_config,
-            )
-            from omnigent.hermes_native_bridge import (
-                bridge_dir_for_session_id as _hermes_bridge_dir2,
             )
 
             labels = await _session_labels_for_runner_spawn(
@@ -14273,12 +14320,16 @@ def create_runner_app(
                 session_id=conv_id,
             )
             _hermes_state_mode = resolve_hermes_native_state_mode(snapshot={"labels": labels})
-            if _hermes_state_mode != STATE_MODE_AMBIENT:
-                _h_server_url2 = os.environ.get(
-                    "RUNNER_SERVER_URL", "http://localhost:6767"
-                ).rstrip("/")
-                write_policy_hook_config(_hermes_bridge_dir2(conv_id), _h_server_url2, conv_id)
-            spawn_env = build_hermes_native_spawn_env(conv_id)
+            _h_server_url2 = (
+                os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/")
+                if _hermes_state_mode != STATE_MODE_AMBIENT
+                else None
+            )
+            spawn_env = prepare_hermes_native_spawn_env(
+                conv_id,
+                state_mode=_hermes_state_mode,
+                server_url=_h_server_url2,
+            )
         if harness_name == "qwen-native" and spawn_env is None:
             from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
 

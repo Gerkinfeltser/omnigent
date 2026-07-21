@@ -72,6 +72,7 @@ from omnigent.runner.app import (
     _session_labels_for_runner_spawn,
     _terminal_lookup_miss_log_state,
     _wake_post_is_retryable,
+    _warn_ambient_fork_history_skip,
 )
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.resource_registry import (
@@ -88,6 +89,19 @@ from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import NullServerClient
 
 # ── Fakes for the runner's collaborators ──────────────────────────────
+
+
+def test_ambient_fork_history_skip_is_warned(caplog: pytest.LogCaptureFixture) -> None:
+    """Ambient sessions must not silently attempt to clone into real state.db."""
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        skipped = _warn_ambient_fork_history_skip(
+            fork_carry_history=True,
+            managed_hermes_home=None,
+            session_id="conv_ambient",
+        )
+
+    assert skipped is True
+    assert "fork-with-history is unavailable in ambient Hermes mode" in caplog.text
 
 
 class _FakeMcpManager:
